@@ -54,3 +54,21 @@ class SalesforceError(Exception):
 
     def __unicode__(self):
         return self.__str__()
+
+
+class SalesforceCompositeErrors(Exception):
+    """Base Salesforce API exception"""
+    errors = []
+    message = u'{error_count} errors found in Salesforce composite request.'
+
+    def __init__(self, errors):
+        # TODO exceptions don't seem to be using parent constructors at all.
+        # this should be fixed.
+        # pylint: disable=super-init-not-called
+        self.errors = errors
+
+    def __str__(self):
+        return self.message.format(error_count=len(self.errors))
+
+    def __unicode__(self):
+        return self.__str__()

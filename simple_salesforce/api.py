@@ -2,7 +2,7 @@
 
 
 # has to be defined prior to login import
-DEFAULT_API_VERSION = '29.0'
+DEFAULT_API_VERSION = '39.0'
 
 
 import logging
@@ -15,9 +15,9 @@ try:
 except ImportError:
     # Python 3+
     from urllib.parse import urlparse, urljoin
+from itertools import islice, chain
 from simple_salesforce.login import SalesforceLogin
-from simple_salesforce.util import date_to_iso8601, SalesforceError
-
+from simple_salesforce.util import date_to_iso8601, SalesforceError, SalesforceCompositeErrors
 try:
     from collections import OrderedDict
 except ImportError:
@@ -26,7 +26,7 @@ except ImportError:
 
 #pylint: disable=invalid-name
 logger = logging.getLogger(__name__)
-
+from pprint import pprint
 
 def _warn_request_deprecation():
     """Deprecation for (Salesforce/SFType).request attribute"""
@@ -471,14 +471,28 @@ class SFType(object):
         self.session_id = session_id
         self.name = object_name
         self.session = session or requests.Session()
+        self.version = float(sf_version)
         # don't wipe out original proxies with None
         if not session and proxies is not None:
             self.session.proxies = proxies
 
+        # self.base_url_without_instance = (
+        #     u'v{sf_version}/sobjects'
+        #     '/{object_name}/'.format(instance=sf_instance,
+        #                              object_name=object_name,
+        #                              sf_version=sf_version))
         self.base_url = (
             u'https://{instance}/services/data/v{sf_version}/sobjects'
             '/{object_name}/'.format(instance=sf_instance,
                                      object_name=object_name,
+                                     sf_version=sf_version))
+        self.instance_url = (
+            u'https://{instance}/services/data/v{sf_version}'.format(
+                                     instance=sf_instance,
+                                     sf_version=sf_version))
+        self.base_url_without_instance = (
+            u'/services/data/v{sf_version}/sobjects'
+            '/{object_name}/'.format(object_name=object_name,
                                      sf_version=sf_version))
 
     def metadata(self, headers=None):
@@ -608,6 +622,47 @@ class SFType(object):
         )
         return self._raw_response(result, raw_response)
 
+    def upsert_composite(self, upsert_key, data, raw_response=True, headers=None):
+        """Creates or updates a list of SObject using a PATCH to
+        `.../composite/batch`.
+
+        See more: https://developer.salesforce.com/docs/atlas.en-us.api_rest.meta/api_rest/resources_composite.htm
+
+        If `raw_response` is false (the default), returns the status code
+        returned by Salesforce. Otherwise, return the `requests.Response`
+        object.
+
+        Arguments:
+        * upsert_key -- a string that matches an external id field
+        * data -- a dict of the data to create or update the SObject from. It
+                  will be JSON-encoded before being transmitted.
+        * raw_response -- a boolean indicating whether to return the response
+                          directly, instead of the status code.
+        * headers -- a dict with additional request headers.
+        """
+
+        # composite/batch for /sobjects/ endpoint was introduced in version 34
+        if self.version < 34:
+            raise StandardError("Composite Batch Requests required API v34.0 or above.")
+
+        # composite/batch only supports 25 records at a time
+        if len(data) > 25:
+            raise StandardError("Composite Requests Only Support 25 Records per call")
+
+        object_url = self.base_url_without_instance + '{upsert_key}/'.format(upsert_key=upsert_key)
+        errors = []
+        batchRequests = []
+        for sfobj in data:
+            temp_upsert_key = sfobj[upsert_key]
+            del sfobj[upsert_key]
+            request_addition = {
+                'method': 'PATCH',
+                'url': object_url + temp_upsert_key,
+                'richInput': sfobj
+            }
+            batchRequests.append(request_addition)
+        response = self._composite_request(batchRequests, raw_response, headers)
+
     def update(self, record_id, data, raw_response=False, headers=None):
         """Updates an SObject using a PATCH to
         `.../{object_name}/{record_id}`.
@@ -705,12 +760,36 @@ class SFType(object):
         }
         additional_headers = kwargs.pop('headers', dict())
         headers.update(additional_headers or dict())
-        result = self.session.request(method, url, headers=headers, **kwargs)
+        results = self.session.request(method, url, headers=headers, **kwargs)
 
-        if result.status_code >= 300:
-            _exception_handler(result, self.name)
+        if results.status_code >= 300:
+            _exception_handler(results, self.name)
 
-        return result
+        return results
+
+    def _composite_request(self, batchRequests, raw_response=True, headers=None):
+        if not raw_response:
+            raise StandardError("raw_response is required for composite requests")
+        test_url = 'https://mutualmobile.my.salesforce.com/services/data/v39.0/'
+        data = {
+            'batchRequests': batchRequests
+        }
+        results = self._call_salesforce(
+            method='POST', url=test_url + 'composite/batch',
+            data=json.dumps(data), headers=headers
+        )
+        # SFDC returns 200 OK for overall request, so we must also check each result inside
+        composite_errors = []
+        for result in results.json()['results']:
+            result = SalesforceCompositeRequest(**result)
+            if result.statusCode >= 300:
+                try:
+                    _exception_handler(result, self.name)
+                except SalesforceError as e:
+                    composite_errors.append(e)
+        if len(composite_errors) > 0:
+            raise SalesforceCompositeErrors(composite_errors)
+        return self._raw_response(results, raw_response)
 
     # pylint: disable=no-self-use
     def _raw_response(self, response, body_flag):
@@ -773,6 +852,9 @@ class SalesforceAPI(Salesforce):
 
 
 def _exception_handler(result, name=""):
+    print '---a'
+    pprint(vars(result))
+    print '---b'
     """Exception router. Determines which error to raise for bad results"""
     try:
         response_content = result.json()
@@ -780,16 +862,42 @@ def _exception_handler(result, name=""):
     except Exception:
         response_content = result.text
 
-    exc_map = {
+    status_code = result.statusCode or result.status_code
+    pprint(response_content)
+    exc_map = _get_exception_map()
+    # # exc_map = {
+    #     300: SalesforceMoreThanOneRecord,
+    #     400: SalesforceMalformedRequest,
+    #     401: SalesforceExpiredSession,
+    #     403: SalesforceRefusedRequest,
+    #     404: SalesforceResourceNotFound,
+    # }
+    exc_cls = exc_map.get(status_code, SalesforceGeneralError)
+
+    raise exc_cls(result.url, result.status_code, name, response_content)
+
+def _get_exception_map():
+    return {
         300: SalesforceMoreThanOneRecord,
         400: SalesforceMalformedRequest,
         401: SalesforceExpiredSession,
         403: SalesforceRefusedRequest,
         404: SalesforceResourceNotFound,
     }
-    exc_cls = exc_map.get(result.status_code, SalesforceGeneralError)
 
-    raise exc_cls(result.url, result.status_code, name, response_content)
+def _batch(iterable, size=25):
+    sourceiter = iter(iterable)
+    while True:
+        batchiter = islice(sourceiter, size)
+        yield chain([batchiter.next()], batchiter)
+
+
+class SalesforceCompositeRequest:
+    status_code = 0
+    text = ''
+    url = ''
+    def __init__(self, **entries):
+        self.__dict__.update(entries)
 
 
 class SalesforceMoreThanOneRecord(SalesforceError):
@@ -839,7 +947,6 @@ class SalesforceResourceNotFound(SalesforceError):
     def __str__(self):
         return self.message.format(name=self.resource_name,
                                    content=self.content)
-
 
 class SalesforceGeneralError(SalesforceError):
     """
